@@ -19,8 +19,12 @@
 
 package org.elasticsearch.action.bulk;
 
-import com.google.common.collect.Sets;
+import java.io.IOException;
+import java.util.Map;
+import java.util.Set;
+
 import org.elasticsearch.ElasticSearchException;
+import org.elasticsearch.ElasticSearchGenerationException;
 import org.elasticsearch.ExceptionsHelper;
 import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.action.RoutingMissingException;
@@ -29,6 +33,7 @@ import org.elasticsearch.action.delete.DeleteResponse;
 import org.elasticsearch.action.index.IndexRequest;
 import org.elasticsearch.action.index.IndexResponse;
 import org.elasticsearch.action.support.replication.TransportShardReplicationOperationAction;
+import org.elasticsearch.action.update.PartialDocumentUpdateRequest;
 import org.elasticsearch.cluster.ClusterService;
 import org.elasticsearch.cluster.ClusterState;
 import org.elasticsearch.cluster.action.index.MappingUpdatedAction;
@@ -41,10 +46,19 @@ import org.elasticsearch.common.Strings;
 import org.elasticsearch.common.collect.Tuple;
 import org.elasticsearch.common.inject.Inject;
 import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.common.xcontent.XContentBuilder;
+import org.elasticsearch.common.xcontent.XContentFactory;
+import org.elasticsearch.common.xcontent.XContentHelper;
+import org.elasticsearch.common.xcontent.XContentType;
 import org.elasticsearch.index.engine.Engine;
+import org.elasticsearch.index.get.GetResult;
 import org.elasticsearch.index.mapper.DocumentMapper;
 import org.elasticsearch.index.mapper.MapperService;
 import org.elasticsearch.index.mapper.SourceToParse;
+import org.elasticsearch.index.mapper.internal.ParentFieldMapper;
+import org.elasticsearch.index.mapper.internal.RoutingFieldMapper;
+import org.elasticsearch.index.mapper.internal.SourceFieldMapper;
+import org.elasticsearch.index.mapper.internal.TTLFieldMapper;
 import org.elasticsearch.index.percolator.PercolatorExecutor;
 import org.elasticsearch.index.service.IndexService;
 import org.elasticsearch.index.shard.ShardId;
@@ -55,9 +69,7 @@ import org.elasticsearch.threadpool.ThreadPool;
 import org.elasticsearch.transport.TransportRequestOptions;
 import org.elasticsearch.transport.TransportService;
 
-import java.io.IOException;
-import java.util.Locale;
-import java.util.Set;
+import com.google.common.collect.Sets;
 
 /**
  * Performs the index operation.
@@ -123,6 +135,78 @@ public class TransportShardBulkAction extends TransportShardReplicationOperation
     protected ShardIterator shards(ClusterState clusterState, BulkShardRequest request) {
         return clusterState.routingTable().index(request.index()).shard(request.shardId()).shardsIt();
     }
+    
+    private void indexRequest(ClusterState clusterState, PrimaryOperationRequest shardRequest,  Engine.IndexingOperation[] ops, long[] versions, BulkItemResponse[] responses, 
+    		Set<Tuple<String, String>> mappingsToUpdate, BulkItemRequest item, IndexShard indexShard, BulkShardRequest request, IndexRequest indexRequest, int i) { 
+    	try {
+
+            // validate, if routing is required, that we got routing
+            MappingMetaData mappingMd = clusterState.metaData().index(request.index()).mappingOrDefault(indexRequest.type());
+            if (mappingMd != null && mappingMd.routing().required()) {
+                if (indexRequest.routing() == null) {
+                    throw new RoutingMissingException(indexRequest.index(), indexRequest.type(), indexRequest.id());
+                }
+            }
+
+            SourceToParse sourceToParse = SourceToParse.source(indexRequest.source()).type(indexRequest.type()).id(indexRequest.id())
+                    .routing(indexRequest.routing()).parent(indexRequest.parent()).timestamp(indexRequest.timestamp()).ttl(indexRequest.ttl());
+
+            long version;
+            Engine.IndexingOperation op;
+            if (indexRequest.opType() == IndexRequest.OpType.INDEX) {
+                Engine.Index index = indexShard.prepareIndex(sourceToParse).version(indexRequest.version()).versionType(indexRequest.versionType()).origin(Engine.Operation.Origin.PRIMARY);
+                indexShard.index(index);
+                version = index.version();
+                op = index;
+            } else {
+                Engine.Create create = indexShard.prepareCreate(sourceToParse).version(indexRequest.version()).versionType(indexRequest.versionType()).origin(Engine.Operation.Origin.PRIMARY);
+                indexShard.create(create);
+                version = create.version();
+                op = create;
+            }
+            versions[i] = indexRequest.version();
+            // update the version on request so it will happen on the replicas
+            indexRequest.version(version);
+
+            // update mapping on master if needed, we won't update changes to the same type, since once its changed, it won't have mappers added
+            if (op.parsedDoc().mappingsModified()) {
+                if (mappingsToUpdate == null) {
+                    mappingsToUpdate = Sets.newHashSet();
+                }
+                mappingsToUpdate.add(Tuple.tuple(indexRequest.index(), indexRequest.type()));
+            }
+
+            // if we are going to percolate, then we need to keep this op for the postPrimary operation
+            if (Strings.hasLength(indexRequest.percolate())) {
+                if (ops == null) {
+                    ops = new Engine.IndexingOperation[request.items().length];
+                }
+                ops[i] = op;
+            }
+
+            // add the response
+            responses[i] = new BulkItemResponse(item.id(), indexRequest.opType().toString().toLowerCase(),
+                    new IndexResponse(indexRequest.index(), indexRequest.type(), indexRequest.id(), version));
+        } catch (Exception e) {
+            // rethrow the failure if we are going to retry on primary and let parent failure to handle it
+            if (retryPrimaryException(e)) {
+                // restore updated versions...
+                for (int j = 0; j < i; j++) {
+                    applyVersion(request.items()[j], versions[j]);
+                }
+                throw (ElasticSearchException) e;
+            }
+            if (e instanceof ElasticSearchException && ((ElasticSearchException) e).status() == RestStatus.CONFLICT) {
+                logger.trace("[{}][{}] failed to execute bulk item (index) {}", e, shardRequest.request.index(), shardRequest.shardId, indexRequest);
+            } else {
+                logger.debug("[{}][{}] failed to execute bulk item (index) {}", e, shardRequest.request.index(), shardRequest.shardId, indexRequest);
+            }
+            responses[i] = new BulkItemResponse(item.id(), indexRequest.opType().toString().toLowerCase(),
+                    new BulkItemResponse.Failure(indexRequest.index(), indexRequest.type(), indexRequest.id(), ExceptionsHelper.detailedMessage(e)));
+            // nullify the request so it won't execute on the replicas
+            request.items()[i] = null;
+        }
+    }
 
     @Override
     protected PrimaryResponse<BulkShardResponse, BulkShardRequest> shardOperationOnPrimary(ClusterState clusterState, PrimaryOperationRequest shardRequest) {
@@ -138,77 +222,84 @@ public class TransportShardBulkAction extends TransportShardReplicationOperation
         for (int i = 0; i < request.items().length; i++) {
             BulkItemRequest item = request.items()[i];
             if (item.request() instanceof IndexRequest) {
-                IndexRequest indexRequest = (IndexRequest) item.request();
-                try {
+                indexRequest(clusterState, shardRequest, ops, versions, responses, 
+                		mappingsToUpdate, item, indexShard, request, (IndexRequest) item.request(), i);
+                
+            } else if(item.request() instanceof PartialDocumentUpdateRequest) { 
+            	PartialDocumentUpdateRequest updateRequest = (PartialDocumentUpdateRequest) item.request();
+            	final GetResult getResult = indexShard.getService().get(updateRequest.getType(), updateRequest.getId(),
+                        new String[]{SourceFieldMapper.NAME, RoutingFieldMapper.NAME, ParentFieldMapper.NAME, TTLFieldMapper.NAME}, true);
 
-                    // validate, if routing is required, that we got routing
-                    MappingMetaData mappingMd = clusterState.metaData().index(request.index()).mappingOrDefault(indexRequest.type());
-                    if (mappingMd != null && mappingMd.routing().required()) {
-                        if (indexRequest.routing() == null) {
-                            throw new RoutingMissingException(indexRequest.index(), indexRequest.type(), indexRequest.id());
-                        }
+                // no doc, what to do, what to do...
+                if (!getResult.isExists()) {
+                    if (updateRequest.getUpsertRequest() == null) {
+                        logger.trace("[{}][{}] failed to execute bulk item, document not indexed yet, " +
+                        		"upsertRequest is missing (update) {}", shardRequest.request.index(), shardRequest.shardId, updateRequest);
+                        responses[i] = new BulkItemResponse(item.id(), "update",
+                                new BulkItemResponse.Failure(updateRequest.index(), updateRequest.getType(), updateRequest.getId(), 
+                                		"Document not indexed and upsertRequest is missing!"));
+                        break;
                     }
-
-                    SourceToParse sourceToParse = SourceToParse.source(indexRequest.source()).type(indexRequest.type()).id(indexRequest.id())
-                            .routing(indexRequest.routing()).parent(indexRequest.parent()).timestamp(indexRequest.timestamp()).ttl(indexRequest.ttl());
-
-                    long version;
-                    Engine.IndexingOperation op;
-                    if (indexRequest.opType() == IndexRequest.OpType.INDEX) {
-                        Engine.Index index = indexShard.prepareIndex(sourceToParse).version(indexRequest.version()).versionType(indexRequest.versionType()).origin(Engine.Operation.Origin.PRIMARY);
-                        indexShard.index(index);
-                        version = index.version();
-                        op = index;
-                    } else {
-                        Engine.Create create = indexShard.prepareCreate(sourceToParse).version(indexRequest.version()).versionType(indexRequest.versionType()).origin(Engine.Operation.Origin.PRIMARY);
-                        indexShard.create(create);
-                        version = create.version();
-                        op = create;
-                    }
-                    versions[i] = indexRequest.version();
-                    // update the version on request so it will happen on the replicas
-                    indexRequest.version(version);
-
-                    // update mapping on master if needed, we won't update changes to the same type, since once its changed, it won't have mappers added
-                    if (op.parsedDoc().mappingsModified()) {
-                        if (mappingsToUpdate == null) {
-                            mappingsToUpdate = Sets.newHashSet();
-                        }
-                        mappingsToUpdate.add(Tuple.tuple(indexRequest.index(), indexRequest.type()));
-                    }
-
-                    // if we are going to percolate, then we need to keep this op for the postPrimary operation
-                    if (Strings.hasLength(indexRequest.percolate())) {
-                        if (ops == null) {
-                            ops = new Engine.IndexingOperation[request.items().length];
-                        }
-                        ops[i] = op;
-                    }
-
-                    // add the response
-                    responses[i] = new BulkItemResponse(item.id(), indexRequest.opType().toString().toLowerCase(Locale.ENGLISH),
-                            new IndexResponse(indexRequest.index(), indexRequest.type(), indexRequest.id(), version));
-                } catch (Exception e) {
-                    // rethrow the failure if we are going to retry on primary and let parent failure to handle it
-                    if (retryPrimaryException(e)) {
-                        // restore updated versions...
-                        for (int j = 0; j < i; j++) {
-                            applyVersion(request.items()[j], versions[j]);
-                        }
-                        throw (ElasticSearchException) e;
-                    }
-                    if (e instanceof ElasticSearchException && ((ElasticSearchException) e).status() == RestStatus.CONFLICT) {
-                        logger.trace("[{}][{}] failed to execute bulk item (index) {}", e, shardRequest.request.index(), shardRequest.shardId, indexRequest);
-                    } else {
-                        logger.debug("[{}][{}] failed to execute bulk item (index) {}", e, shardRequest.request.index(), shardRequest.shardId, indexRequest);
-                    }
-                    responses[i] = new BulkItemResponse(item.id(), indexRequest.opType().toString().toLowerCase(Locale.ENGLISH),
-                            new BulkItemResponse.Failure(indexRequest.index(), indexRequest.type(), indexRequest.id(), ExceptionsHelper.detailedMessage(e)));
-                    // nullify the request so it won't execute on the replicas
-                    request.items()[i] = null;
+                    
+                    indexRequest(clusterState, shardRequest, ops, versions, responses, mappingsToUpdate, 
+                    		item, indexShard, request, updateRequest.getUpsertRequest(), i);
                 }
+                
+                if (getResult.internalSourceRef() == null) {
+                	logger.trace("[{}][{}] failed to execute bulk item, indexed document without source (update) {}", shardRequest.request.index(), shardRequest.shardId, updateRequest);
+                    responses[i] = new BulkItemResponse(item.id(), "update",
+                            new BulkItemResponse.Failure(updateRequest.index(), updateRequest.getType(), updateRequest.getId(), 
+                            		"Indexed document without source!"));
+                    break;
+                }
+
+                Tuple<XContentType, Map<String, Object>> sourceAndContent = XContentHelper.convertToMap(getResult.internalSourceRef(), true);
+               // String operation = null;
+               // String timestamp = null;
+                Long ttl = null;
+               // Object fetchedTTL = null;
+                final Map<String, Object> updatedSourceAsMap;
+                final XContentType updateSourceContentType = sourceAndContent.v1();
+                String routing = getResult.getFields().containsKey(RoutingFieldMapper.NAME) ? getResult.field(RoutingFieldMapper.NAME).getValue().toString() : null;
+                String parent = getResult.getFields().containsKey(ParentFieldMapper.NAME) ? getResult.field(ParentFieldMapper.NAME).getValue().toString() : null;
+
+                IndexRequest indexRequest = updateRequest.getDoc();
+                updatedSourceAsMap = sourceAndContent.v2();
+                if (indexRequest.ttl() > 0) {
+                    ttl = indexRequest.ttl();
+                }
+               // timestamp = indexRequest.getTimestamp();
+                if (indexRequest.routing() != null) {
+                    routing = indexRequest.routing();
+                }
+                if (indexRequest.parent() != null) {
+                    parent = indexRequest.parent();
+                }
+                XContentHelper.update(updatedSourceAsMap, indexRequest.sourceAsMap());
+                
+                XContentBuilder builder = null;
+                try {
+                    builder = XContentFactory.contentBuilder(updateSourceContentType);
+                    builder.map(updatedSourceAsMap);
+                } catch (IOException e) {
+                    throw new ElasticSearchGenerationException("Failed to generate [" + updatedSourceAsMap + "]", e);
+                }
+                
+                SourceToParse sourceToParse = SourceToParse.source(builder.bytes()).type(updateRequest.getType()).id(updateRequest.getId())
+                        .routing(routing).parent(parent);
+                
+                Engine.Index index = indexShard.prepareIndex(sourceToParse).version(indexRequest.version()).
+                		versionType(indexRequest.versionType()).origin(Engine.Operation.Origin.PRIMARY);
+                indexShard.index(index);
+                
+                // add the response
+                responses[i] = new BulkItemResponse(item.id(), "update",
+                        new IndexResponse(updateRequest.index(), updateRequest.getType(), updateRequest.getId(), indexRequest.version()));
+                
+            	
             } else if (item.request() instanceof DeleteRequest) {
                 DeleteRequest deleteRequest = (DeleteRequest) item.request();
+
                 try {
                     Engine.Delete delete = indexShard.prepareDelete(deleteRequest.type(), deleteRequest.id(), deleteRequest.version()).versionType(deleteRequest.versionType()).origin(Engine.Operation.Origin.PRIMARY);
                     indexShard.delete(delete);
