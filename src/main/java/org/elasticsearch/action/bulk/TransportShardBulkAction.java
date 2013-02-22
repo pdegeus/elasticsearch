@@ -222,6 +222,7 @@ public class TransportShardBulkAction extends TransportShardReplicationOperation
         for (int i = 0; i < request.items().length; i++) {
             BulkItemRequest item = request.items()[i];
             if (item.request() instanceof IndexRequest) {
+            	
                 indexRequest(clusterState, shardRequest, ops, versions, responses, 
                 		mappingsToUpdate, item, indexShard, request, (IndexRequest) item.request(), i);
                 
