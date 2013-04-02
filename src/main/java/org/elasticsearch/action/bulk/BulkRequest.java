@@ -19,7 +19,12 @@
 
 package org.elasticsearch.action.bulk;
 
-import com.google.common.collect.Lists;
+import static org.elasticsearch.action.ValidateActions.addValidationError;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
+
 import org.elasticsearch.ElasticSearchIllegalArgumentException;
 import org.elasticsearch.action.ActionRequest;
 import org.elasticsearch.action.ActionRequestValidationException;
@@ -39,11 +44,7 @@ import org.elasticsearch.common.xcontent.XContentFactory;
 import org.elasticsearch.common.xcontent.XContentParser;
 import org.elasticsearch.index.VersionType;
 
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.List;
-
-import static org.elasticsearch.action.ValidateActions.addValidationError;
+import com.google.common.collect.Lists;
 
 /**
  * A bulk request holds an ordered {@link IndexRequest}s and {@link DeleteRequest}s and allows to executes
@@ -143,7 +144,7 @@ public class BulkRequest extends ActionRequest<BulkRequest> {
     BulkRequest internalAdd(PartialDocumentUpdateRequest request, @Nullable Object payload) {
         requests.add(request);
         addPayload(payload);
-        sizeInBytes += request.getDoc().getSource().length() + REQUEST_OVERHEAD;
+        sizeInBytes += request.getDoc().source().length() + REQUEST_OVERHEAD;
         return this;
     }
 
