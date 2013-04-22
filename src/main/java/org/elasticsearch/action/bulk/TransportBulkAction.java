@@ -263,6 +263,11 @@ public class TransportBulkAction extends TransportAction<BulkRequest, BulkRespon
                                 DeleteRequest deleteRequest = (DeleteRequest) request.request();
                                 responses[request.id()] = new BulkItemResponse(request.id(), "delete",
                                         new BulkItemResponse.Failure(deleteRequest.index(), deleteRequest.type(), deleteRequest.id(), message));
+                            } else if (request.request() instanceof PartialDocumentUpdateRequest ){
+                            	PartialDocumentUpdateRequest updateRequest = (PartialDocumentUpdateRequest) request.request();
+                            	responses[request.id()] = new BulkItemResponse(request.id(), "update",
+                                        new BulkItemResponse.Failure(updateRequest.index(), updateRequest.getType(), updateRequest.getId(), message));
+                            	
                             }
                         }
                     }

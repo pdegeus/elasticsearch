@@ -241,6 +241,7 @@ public class TransportShardBulkAction extends TransportShardReplicationOperation
 
                 // no doc, what to do, what to do...
                 if (!getResult.isExists()) {
+                	logger.debug("no existing document found for update request {}, start normal indexing",updateRequest.getId());
                     if (updateRequest.getUpsertRequest() == null) {
                         logger.debug(
                             "[{}][{}] failed to execute bulk item, document not indexed yet, upsertRequest is missing (update) {}",
@@ -253,6 +254,8 @@ public class TransportShardBulkAction extends TransportShardReplicationOperation
                         continue;
                     }
 
+                    updateRequest.getUpsertRequest().create(true);
+                    
                     indexRequest(
                         clusterState, shardRequest, ops, versions, responses, mappingsToUpdate,
                         item, indexShard, request, updateRequest.getUpsertRequest(), i
@@ -278,10 +281,7 @@ public class TransportShardBulkAction extends TransportShardReplicationOperation
                 String parent = getResult.getFields().containsKey(ParentFieldMapper.NAME) ? getResult.field(ParentFieldMapper.NAME).getValue().toString() : null;
 
                 IndexRequest indexRequest = updateRequest.getDoc();
-                
-                // set the version
-                indexRequest.version(getResult.version()+1);
-                
+                        
                 updatedSourceAsMap = sourceAndContent.v2();
 
                 if (indexRequest.routing() != null) {
@@ -303,9 +303,17 @@ public class TransportShardBulkAction extends TransportShardReplicationOperation
                 SourceToParse sourceToParse = SourceToParse.source(builder.bytes()).type(updateRequest.getType()).id(updateRequest.getId())
                         .routing(routing).parent(parent);
                 
-                Engine.Index index = indexShard.prepareIndex(sourceToParse).version(indexRequest.version()).
+                long version;
+                Engine.Index index = indexShard.prepareIndex(sourceToParse).version(getResult.getVersion()).
                 		versionType(indexRequest.versionType()).origin(Engine.Operation.Origin.PRIMARY);
                 indexShard.index(index);
+                version = index.version();
+                
+                versions[i] = indexRequest.version();
+                // update the version on request so it will happen on the replicas
+                indexRequest.version(version);
+                
+                updateRequest.getDoc().create(false);
                 
                 // add the response
                 responses[i] = new BulkItemResponse(
@@ -437,9 +445,9 @@ public class TransportShardBulkAction extends TransportShardReplicationOperation
             	
             	// document is already merged in shardOperationOnPrimary action
             	
-            	IndexRequest indexRequest = updateRequest.getUpsertRequest();
+            	IndexRequest indexRequest = updateRequest.getDoc();
             	if(indexRequest == null) { 
-            		indexRequest = updateRequest.getDoc();
+            		indexRequest = updateRequest.getUpsertRequest();
             	}
             	indexRequestOnReplica(indexShard, indexRequest);
             	
